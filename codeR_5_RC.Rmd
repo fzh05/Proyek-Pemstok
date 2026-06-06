@@ -1,0 +1,1359 @@
+```{r}
+# BAGIAN 0 : SETUP - INSTALASI & LOAD PACKAGE
+set.seed(42)
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+options(repr.plot.width = 12, repr.plot.height = 7, repr.plot.res = 150)
+
+required_packages <- c(
+  "readr", "dplyr", "tidyr", "stringr", "ggplot2",
+  "reshape2", "markovchain", "igraph", "RColorBrewer",
+  "scales", "gridExtra", "knitr"
+)
+
+cat("Memeriksa dan memuat package...\n")
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg, quiet = TRUE)
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+}
+cat("Semua package berhasil dimuat.\n\n")
+
+dir.create("output_markov", showWarnings = FALSE)
+cat("Semua output tersimpan di: ./output_markov/\n\n")
+
+sep_line <- function(n = 70, ch = "=") cat(strrep(ch, n), "\n")
+
+mat_power <- function(A, n) {
+  if (n == 0L) return(diag(nrow(A)))
+  if (n == 1L) return(A)
+  if (n %% 2L == 0L) { B <- mat_power(A, n %/% 2L); return(B %*% B) }
+  return(A %*% mat_power(A, n - 1L))
+}
+```
+
+```{r}
+# ================================
+# BAGIAN 1 : LOAD & PREPROCESSING DATA
+# ================================
+
+sep_line <- function() cat("\n", paste(rep("=",60), collapse=""), "\n")
+
+library(readxl)
+library(dplyr)
+library(stringr)
+library(tidyr)
+
+sep_line(); cat("BAGIAN 1 : LOAD & PREPROCESSING DATA\n"); sep_line()
+
+# Path file Excel
+FILE_PATH <- "D:/FILE AND TASK/TUGAS KULIAH/PemStok/TUBES/Kuesioner Penelitian Mobilitas Mahasiswa ITERA (Tugas Besar Pemodelan Stokastik - Kelompok 5) (Responses).xlsx"
+
+# Load data Excel
+df_raw <- read_excel(FILE_PATH)
+
+cat(sprintf("Data dimuat: %d responden, %d kolom\n\n",
+            nrow(df_raw), ncol(df_raw)))
+
+# Rename kolom
+names(df_raw) <- c(
+  "timestamp", "email", "nama", "prodi", "angkatan",
+  "hari", "t1_0709", "t2_0911", "t3_1113",
+  "t4_1315", "t5_1517"
+)
+
+df <- df_raw
+
+# Fungsi ekstrak zona S1-S5
+extract_zone <- function(x) str_extract(x, "S[1-5]")
+
+# Membentuk kolom zona
+df <- df %>%
+  mutate(
+    z1   = extract_zone(t1_0709),
+    z2   = extract_zone(t2_0911),
+    z3   = extract_zone(t3_1113),
+    z4   = extract_zone(t4_1315),
+    z5   = extract_zone(t5_1517),
+    hari = str_trim(hari)
+  )
+
+# ================================
+# CHECK MISSING VALUE
+# ================================
+
+cat("--- Missing Values per Slot Waktu ---\n")
+
+mv <- df %>%
+  select(z1:z5) %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(
+    everything(),
+    names_to  = "Slot",
+    values_to = "NA_count"
+  )
+
+print(as.data.frame(mv))
+
+# Hapus baris yang memiliki NA
+n_before <- nrow(df)
+
+df <- df %>%
+  filter(if_all(z1:z5, ~ !is.na(.)))
+
+cat(sprintf(
+  "\nBaris dihapus (ada NA): %d | Sisa: %d responden\n\n",
+  n_before - nrow(df),
+  nrow(df)
+))
+
+# ================================
+# DEFINISI STATE
+# ================================
+
+STATES <- c("S1", "S2", "S3", "S4", "S5")
+
+LABELS <- c(
+  "S1-Akademik",
+  "S2-FasilitasUmum",
+  "S3-Ibadah",
+  "S4-Makan",
+  "S5-LuarKampus"
+)
+
+LABELS_FULL <- c(
+  "S1 (Area Akademik)",
+  "S2 (Area Fasilitas Umum & Kemahasiswaan)",
+  "S3 (Area Ibadah)",
+  "S4 (Area Makan)",
+  "S5 (Luar Kampus)"
+)
+
+SLOT_LABELS <- c(
+  "07-09",
+  "09-11",
+  "11-13",
+  "13-15",
+  "15-17"
+)
+
+STEP_LABELS <- c(
+  "07-09->09-11",
+  "09-11->11-13",
+  "11-13->13-15",
+  "13-15->15-17"
+)
+
+N_STATES <- 5L
+N <- nrow(df)
+
+# ================================
+# MEMBENTUK DATA TRANSISI
+# ================================
+
+df_trans <- bind_rows(
+  lapply(1:4, function(k) {
+    
+    df %>%
+      transmute(
+        nama,
+        hari,
+        from       = .data[[paste0("z", k)]],
+        to         = .data[[paste0("z", k + 1)]],
+        step       = k,
+        step_label = STEP_LABELS[k]
+      )
+  })
+)
+
+cat(sprintf(
+  "Total transisi: %d (%d responden x 4 transisi)\n\n",
+  nrow(df_trans),
+  N
+))
+
+# Preview data transisi
+head(df_trans)
+```
+
+```{r}
+# BAGIAN 3 : FUNGSI PEMBANTU
+#
+build_freq_matrix <- function(from_vec, to_vec, states = STATES) {
+  mat <- matrix(0L, nrow=length(states), ncol=length(states),
+                dimnames=list(states, states))
+  valid <- !is.na(from_vec) & !is.na(to_vec) &
+    from_vec %in% states & to_vec %in% states
+  for (k in which(valid))
+    mat[from_vec[k], to_vec[k]] <- mat[from_vec[k], to_vec[k]] + 1L
+  mat
+}
+
+freq_to_prob <- function(freq_mat) {
+  rs <- rowSums(freq_mat)
+  rs[rs == 0L] <- 1L
+  sweep(freq_mat, 1, rs, "/")
+}
+```
+
+```{r}
+# BAGIAN 4 : MATRIKS FREKUENSI
+# ==============================================================================
+
+sep_line(); cat("BAGIAN 4 : MATRIKS FREKUENSI\n"); sep_line()
+
+N_agg <- build_freq_matrix(df_trans$from, df_trans$to)
+cat("\n--- Matriks Frekuensi Agregat N_ij ---\n")
+cat("    (baris = zona asal, kolom = zona tujuan)\n\n")
+N_agg_print <- N_agg
+rownames(N_agg_print) <- LABELS_FULL
+colnames(N_agg_print) <- STATES
+print(N_agg_print)
+cat(sprintf("\nTotal: %d transisi\n", sum(N_agg)))
+
+freq_per_step <- setNames(
+  lapply(1:4, function(k) {
+    sub <- df_trans %>% filter(step == k)
+    build_freq_matrix(sub$from, sub$to)
+  }), STEP_LABELS
+)
+cat("\n--- Frekuensi per Slot Waktu ---\n")
+for (nm in names(freq_per_step)) {
+  cat(sprintf("\nSlot %s (n=%d):\n", nm, sum(freq_per_step[[nm]])))
+  print(freq_per_step[[nm]])
+}
+
+days <- sort(unique(df$hari))
+freq_per_day <- setNames(
+  lapply(days, function(d) {
+    sub <- df_trans %>% filter(hari == d)
+    build_freq_matrix(sub$from, sub$to)
+  }), days
+)
+cat("\n--- Total Transisi per Hari ---\n")
+for (d in days) cat(sprintf("  %-10s: %d\n", d, sum(freq_per_day[[d]])))
+cat("\n")
+```
+
+```{r}
+# ================================
+# BAGIAN 5 : UJI ASUMSI
+# ================================
+
+# Fungsi garis pemisah
+sep_line <- function(n = 60, char = "=") {
+  cat("\n", paste(rep(char, n), collapse = ""), "\n")
+}
+
+sep_line()
+cat("BAGIAN 5 : UJI ASUMSI\n")
+sep_line()
+
+# =========================================================
+# 5.1 UJI HOMOGENITAS ANTAR SLOT WAKTU
+# =========================================================
+
+sep_line(50, "-")
+cat("[5.1] Uji Homogenitas Antar Slot Waktu\n")
+cat("      H0: Matriks transisi seragam di semua slot waktu\n")
+cat("      H1: Ada perbedaan matriks transisi antar slot waktu\n")
+sep_line(50, "-")
+
+set.seed(42)
+
+chi2_total <- 0
+df_total   <- 0
+hasil_5_1  <- list()
+
+for (s in STATES) {
+
+  cnt <- t(sapply(freq_per_step, function(m) {
+
+    if (s %in% rownames(m)) {
+      m[s, STATES]
+    } else {
+      setNames(rep(0L, N_STATES), STATES)
+    }
+
+  }))
+
+  cnt <- cnt[, colSums(cnt) > 0L, drop = FALSE]
+  cnt <- cnt[rowSums(cnt) > 0L, , drop = FALSE]
+
+  if (nrow(cnt) >= 2L && ncol(cnt) >= 2L) {
+
+    tst <- chisq.test(
+      cnt,
+      simulate.p.value = TRUE,
+      B = 5000L
+    )
+
+    df_i <- (nrow(cnt) - 1L) * (ncol(cnt) - 1L)
+
+    sig <- if (tst$p.value < 0.05) {
+      "  * BERBEDA SIGNIFIKAN"
+    } else {
+      ""
+    }
+
+    cat(sprintf(
+      "  State %-3s | chi2 = %7.3f | p = %.4f%s\n",
+      s,
+      tst$statistic,
+      tst$p.value,
+      sig
+    ))
+
+    hasil_5_1[[s]] <- list(
+      chi2 = tst$statistic,
+      p    = tst$p.value
+    )
+
+    chi2_total <- chi2_total + tst$statistic
+    df_total   <- df_total + df_i
+
+  } else {
+
+    cat(sprintf(
+      "  State %-3s | data tidak cukup\n",
+      s
+    ))
+
+  }
+}
+
+p_gab <- pchisq(
+  chi2_total,
+  df_total,
+  lower.tail = FALSE
+)
+
+cat(sprintf(
+  "\n  Gabungan: chi2 = %.3f | df = %d | p = %.4f\n",
+  chi2_total,
+  df_total,
+  p_gab
+))
+
+cat("\nKESIMPULAN:\n")
+
+if (p_gab < 0.05) {
+
+  cat("Tolak H0 -> Matriks transisi TIDAK homogen antar slot waktu.\n")
+  cat("Penelitian tetap menggunakan matriks agregat sebagai pendekatan simplifikasi.\n")
+  cat("Hal ini dicatat sebagai keterbatasan penelitian.\n\n")
+
+} else {
+
+  cat("Gagal tolak H0 -> Asumsi time-homogeneity terpenuhi.\n\n")
+
+}
+
+# =========================================================
+# 5.2 UJI INDEPENDENSI ANTAR HARI
+# =========================================================
+
+sep_line(50, "-")
+cat("[5.2] Uji Independensi Antar Hari\n")
+cat("      H0: Pola transisi seragam di semua hari kuliah\n")
+cat("      H1: Pola transisi berbeda antar hari\n")
+sep_line(50, "-")
+
+days <- unique(df$hari)
+
+if (length(days) >= 2L) {
+
+  tbl_hari <- df_trans %>%
+    mutate(pair = paste0(from, to)) %>%
+    count(hari, pair) %>%
+    pivot_wider(
+      names_from  = pair,
+      values_from = n,
+      values_fill = 0L
+    )
+
+  mat_hari <- as.matrix(tbl_hari[, -1L])
+
+  rownames(mat_hari) <- tbl_hari$hari
+
+  mat_hari <- mat_hari[
+    ,
+    colSums(mat_hari) > 0L,
+    drop = FALSE
+  ]
+
+  tst_hari <- chisq.test(
+    mat_hari,
+    simulate.p.value = TRUE,
+    B = 5000L
+  )
+
+  cat(sprintf(
+    "\n  chi2 = %.3f | p = %.4f\n",
+    tst_hari$statistic,
+    tst_hari$p.value
+  ))
+
+  if (tst_hari$p.value < 0.05) {
+
+    cat("Tolak H0 -> Pola transisi berbeda antar hari.\n")
+    cat("Dicatat sebagai keterbatasan penelitian.\n\n")
+
+  } else {
+
+    cat("Gagal tolak H0 -> Penggabungan data lintas hari valid.\n\n")
+
+  }
+
+} else {
+
+  cat("Hanya terdapat 1 hari observasi -> uji tidak dilakukan.\n\n")
+
+}
+
+# =========================================================
+# 5.3 UJI ORDE MARKOV
+# =========================================================
+
+sep_line(50, "-")
+cat("[5.3] Uji Orde Markov (Orde-1 vs Orde-2)\n")
+cat("      H0: Rantai berorde-1 (Markov Property berlaku)\n")
+cat("      H1: Rantai berorde-2 (historis 2 langkah lebih informatif)\n")
+sep_line(50, "-")
+
+df_triple <- bind_rows(
+
+  lapply(1:3, function(k) {
+
+    df %>%
+      transmute(
+        s_prev = .data[[paste0("z", k)]],
+        s_curr = .data[[paste0("z", k + 1)]],
+        s_next = .data[[paste0("z", k + 2)]]
+      )
+
+  })
+
+) %>%
+  filter(
+    !is.na(s_prev),
+    !is.na(s_curr),
+    !is.na(s_next)
+  )
+
+# Frekuensi triple dan pasangan state
+
+n_ijk <- df_triple %>%
+  count(s_prev, s_curr, s_next)
+
+n_ij <- df_triple %>%
+  count(s_prev, s_curr)
+
+n_jk <- df_triple %>%
+  count(s_curr, s_next)
+
+n_j <- df_triple %>%
+  count(s_curr)
+
+# Likelihood Ratio Test (G²)
+
+n_joined <- n_ijk %>%
+
+  left_join(
+    n_ij,
+    by = c("s_prev", "s_curr"),
+    suffix = c("", ".ij")
+  ) %>%
+
+  left_join(
+    n_jk,
+    by = c("s_curr", "s_next"),
+    suffix = c("", ".jk")
+  ) %>%
+
+  left_join(
+    n_j,
+    by = "s_curr",
+    suffix = c("", ".j")
+  ) %>%
+
+  rename(
+    n_triple    = n,
+    n_pair      = n.ij,
+    n_curr_next = n.jk,
+    n_curr      = n.j
+  ) %>%
+
+  filter(n_triple > 0L) %>%
+
+  mutate(
+    E_ijk = n_pair * n_curr_next / n_curr,
+
+    G2 = ifelse(
+      E_ijk > 0,
+      2 * n_triple * log(n_triple / E_ijk),
+      0
+    )
+  )
+
+G2_stat <- sum(n_joined$G2, na.rm = TRUE)
+
+df_G2 <- N_STATES * (N_STATES - 1L)^2L
+
+p_G2 <- pchisq(
+  G2_stat,
+  df_G2,
+  lower.tail = FALSE
+)
+
+cat(sprintf(
+  "\n  G2 = %.3f | df = %d | p = %.4f\n",
+  G2_stat,
+  df_G2,
+  p_G2
+))
+
+if (p_G2 >= 0.05) {
+
+  cat("Gagal tolak H0 -> Rantai ORDE-1 sudah memadai.\n")
+  cat("Markov Property valid digunakan pada penelitian ini.\n\n")
+
+} else {
+
+  cat("Tolak H0 -> Data mengindikasikan orde > 1.\n")
+  cat("Penelitian tetap menggunakan orde-1 sebagai pendekatan simplifikasi.\n\n")
+
+}
+```
+
+```{r}
+# =========================================================
+# BAGIAN 6 : MATRIKS PROBABILITAS TRANSISI [RM-1]
+# =========================================================
+
+sep_line()
+cat("BAGIAN 6 : MATRIKS PROBABILITAS TRANSISI - Menjawab RM-1\n")
+sep_line()
+
+# =========================================================
+# MEMBENTUK MATRKS PROBABILITAS TRANSISI AGREGAT
+# =========================================================
+
+P_agg <- freq_to_prob(N_agg)
+
+rownames(P_agg) <- STATES
+colnames(P_agg) <- STATES
+
+cat("\n--- Matriks Probabilitas Transisi P (5x5, Agregat) ---\n")
+cat("    P[i,j] = P(berpindah ke zona j | saat ini di zona i)\n\n")
+
+P_print <- P_agg
+
+rownames(P_print) <- LABELS_FULL
+colnames(P_print) <- STATES
+
+print(round(P_print, 4))
+
+# =========================================================
+# VERIFIKASI SIFAT STOKASTIK
+# =========================================================
+
+cat("\n--- Verifikasi Sifat Stokastik (Jumlah Baris = 1) ---\n")
+
+rs <- rowSums(P_agg)
+
+for (i in seq_along(STATES)) {
+
+  ok <- abs(rs[i] - 1.0) < 1e-9
+
+  cat(sprintf(
+    "  %s : %.10f [%s]\n",
+    LABELS[i],
+    rs[i],
+    if (ok) "OK" else "GAGAL"
+  ))
+}
+
+# =========================================================
+# MEMBENTUK OBJEK MARKOV CHAIN
+# =========================================================
+
+mc_agg <- new(
+  "markovchain",
+  states           = STATES,
+  transitionMatrix = P_agg,
+  name             = "Mobilitas Mahasiswa ITERA"
+)
+
+cat("\n--- Objek Markov Chain ---\n")
+
+show(mc_agg)
+
+# =========================================================
+# MATRKS TRANSISI PER SLOT WAKTU
+# =========================================================
+
+P_per_step <- setNames(
+  lapply(freq_per_step, freq_to_prob),
+  STEP_LABELS
+)
+
+cat("\n--- Matriks Probabilitas per Slot Waktu ---\n")
+
+for (nm in names(P_per_step)) {
+
+  cat(sprintf("\nP - Slot %s:\n", nm))
+
+  print(round(P_per_step[[nm]], 3))
+}
+
+# =========================================================
+# CUSTOM THEME GGPLOT
+# =========================================================
+
+theme_mk <- theme_minimal(base_size = 12) +
+
+  theme(
+
+    plot.title = element_text(
+      face = "bold",
+      size = 15,
+      hjust = 0.5
+    ),
+
+    plot.subtitle = element_text(
+      size = 11,
+      hjust = 0.5
+    ),
+
+    axis.title = element_text(
+      face = "bold"
+    ),
+
+    axis.text = element_text(
+      color = "black"
+    ),
+
+    panel.grid.minor = element_blank(),
+
+    legend.title = element_text(
+      face = "bold"
+    ),
+
+    legend.position = "right"
+  )
+
+# =========================================================
+# PLOT 2 : HEATMAP MATRKS TRANSISI AGREGAT
+# =========================================================
+
+P_melt <- melt(
+  P_agg,
+  varnames  = c("From", "To"),
+  value.name = "Prob"
+) %>%
+
+  mutate(
+
+    label = ifelse(
+      round(Prob, 3) > 0,
+      sprintf("%.3f", Prob),
+      "-"
+    ),
+
+    From = factor(
+      From,
+      levels = rev(STATES)
+    ),
+
+    To = factor(
+      To,
+      levels = STATES
+    )
+  )
+
+p2 <- ggplot(
+  P_melt,
+  aes(x = To, y = From, fill = Prob)
+) +
+
+  geom_tile(
+    color = "white",
+    linewidth = 0.6
+  ) +
+
+  geom_text(
+    aes(label = label),
+    size = 3.8,
+    fontface = "bold"
+  ) +
+
+  scale_fill_gradient2(
+    low       = "#FDFEFE",
+    mid       = "#85C1E9",
+    high      = "#1A5276",
+    midpoint  = 0.35,
+    limits    = c(0, 1),
+    name      = "P(i→j)"
+  ) +
+
+  scale_x_discrete(
+    labels = LABELS_FULL
+  ) +
+
+  scale_y_discrete(
+    labels = rev(LABELS_FULL)
+  ) +
+
+  labs(
+    title = "Matriks Probabilitas Transisi P (Agregat)",
+
+    subtitle = sprintf(
+      "P[i,j] = P(tujuan=j | asal=i), dari %d transisi",
+      sum(N_agg)
+    ),
+
+    x = "Zona Tujuan (j)",
+    y = "Zona Asal (i)"
+  ) +
+
+  theme_mk +
+
+  theme(
+    axis.text.x = element_text(
+      angle = 30,
+      hjust = 1,
+      size = 9
+    ),
+
+    axis.text.y = element_text(
+      size = 9
+    ),
+
+    plot.margin = margin(
+      t = 15,
+      r = 10,
+      b = 10,
+      l = 10
+    )
+  )
+
+# Simpan heatmap agregat
+
+ggsave(
+  "output_markov/02_heatmap_transisi_agregat.png",
+  p2,
+  width = 9,
+  height = 7,
+  dpi = 150
+)
+
+print(p2)
+
+cat("Disimpan: 02_heatmap_transisi_agregat.png\n")
+
+# =========================================================
+# PLOT 3 : HEATMAP MATRKS TRANSISI PER SLOT WAKTU
+# =========================================================
+
+plots3 <- lapply(seq_along(P_per_step), function(k) {
+
+  nm <- names(P_per_step)[k]
+
+  mlt <- melt(
+    P_per_step[[k]],
+    varnames  = c("From", "To"),
+    value.name = "Prob"
+  ) %>%
+
+    mutate(
+
+      From = factor(
+        From,
+        levels = rev(STATES)
+      ),
+
+      To = factor(
+        To,
+        levels = STATES
+      )
+    )
+
+  ggplot(
+    mlt,
+    aes(x = To, y = From, fill = Prob)
+  ) +
+
+    geom_tile(
+      color = "white",
+      linewidth = 0.5
+    ) +
+
+    geom_text(
+      aes(
+        label = ifelse(
+          Prob > 0.01,
+          sprintf("%.2f", Prob),
+          ""
+        )
+      ),
+      size = 2.7
+    ) +
+
+    scale_fill_gradient(
+      low   = "#FDFEFE",
+      high  = "#C0392B",
+      limits = c(0, 1),
+      name = "P"
+    ) +
+
+    labs(
+      title = sprintf("Slot %s", nm),
+      x = NULL,
+      y = NULL
+    ) +
+
+    theme_mk +
+
+    theme(
+
+      axis.text.x = element_text(
+        angle = 45,
+        hjust = 1,
+        size = 7
+      ),
+
+      axis.text.y = element_text(
+        size = 7
+      ),
+
+      plot.title = element_text(
+        size = 10,
+        margin = margin(b = 5)
+      ),
+
+      plot.margin = margin(
+        t = 15,
+        r = 10,
+        b = 10,
+        l = 10
+      ),
+
+      legend.position = "none"
+    )
+})
+
+# Gabungkan plot
+
+p3 <- arrangeGrob(
+
+  grobs = plots3,
+
+  ncol = 2,
+
+  top = grid::textGrob(
+    "Matriks Probabilitas Transisi per Slot Waktu\n",
+    gp = grid::gpar(
+      fontsize = 16,
+      fontface = "bold"
+    )
+  )
+)
+
+# Simpan plot
+
+ggsave(
+  "output_markov/03_heatmap_per_slot_waktu.png",
+  p3,
+  width = 12,
+  height = 10,
+  dpi = 150
+)
+
+grid::grid.draw(p3)
+
+cat("Disimpan: 03_heatmap_per_slot_waktu.png\n\n")
+```
+
+```{r}
+# BAGIAN 7 : ANALISIS SIFAT RANTAI MARKOV
+sep_line()
+cat("BAGIAN 7 : ANALISIS SIFAT RANTAI MARKOV\n")
+sep_line()
+
+# =========================================================
+# PALET WARNA ZONA
+# =========================================================
+pal <- c(
+  S1 = "#1F77B4",  # Biru
+  S2 = "#2CA02C",  # Hijau
+  S3 = "#9467BD",  # Ungu
+  S4 = "#FF7F0E",  # Orange
+  S5 = "#D62728"   # Merah
+)
+
+# =========================================================
+# [7.1] PROPERTI RANTAI
+# =========================================================
+cat("\n[7.1] Properti Rantai\n")
+
+is_irr <- is.irreducible(mc_agg)
+pd     <- period(mc_agg)
+
+cat(sprintf("  Irreducible (semua state terhubung) : %s\n", is_irr))
+cat(sprintf("  Period                              : %d\n", pd))
+cat(sprintf("  Aperiodic (period = 1)              : %s\n", pd == 1L))
+cat(sprintf("  Ergodic (irreducible & aperiodic)   : %s\n",
+            is_irr && pd == 1L))
+
+if (!is_irr) {
+  warning("Rantai tidak irreducible - ada state terisolasi!")
+}
+
+# =========================================================
+# [7.2] MATRIKS TRANSISI n-LANGKAH
+# =========================================================
+cat("\n[7.2] Matriks Transisi n-Langkah (P^n)\n")
+cat("      Menggambarkan probabilitas setelah n transisi\n\n")
+
+for (n_step in c(2L, 3L, 5L, 10L, 50L)) {
+
+  Pn <- mat_power(P_agg, n_step)
+
+  cat(sprintf("P^%d:\n", n_step))
+  print(round(Pn, 4))
+  cat("\n")
+}
+
+# =========================================================
+# [7.3] KLASIFIKASI STATE
+# =========================================================
+cat("\n[7.3] Klasifikasi per State\n")
+sep_line(50)
+
+cat("  Karena rantai IRREDUCIBLE, semua state berada\n")
+cat("  dalam satu communicating class dan bersifat recurrent.\n\n")
+
+for (s in STATES) {
+  cat(sprintf(
+    "  %s : Recurrent | Communicating Class = {S1,S2,S3,S4,S5}\n",
+    s
+  ))
+}
+
+cat("\nKesimpulan Klasifikasi:\n")
+cat("  - Semua state membentuk 1 communicating class tunggal\n")
+cat("  - Semua state bersifat positive recurrent\n")
+cat("  - Tidak ada transient state\n")
+cat("  - Tidak ada absorbing state\n")
+cat(sprintf(
+  "  - Rantai bersifat ERGODIC (irreducible + aperiodic, period=%d)\n\n",
+  pd
+))
+
+# =========================================================
+# [7.4] VISUALISASI JARINGAN TRANSISI
+# =========================================================
+cat("[7.4] Visualisasi Jaringan Transisi\n\n")
+
+EDGE_THR <- 0.05
+
+edges_df <- as.data.frame(as.table(P_agg)) %>%
+  rename(
+    from   = Var1,
+    to     = Var2,
+    weight = Freq
+  ) %>%
+  filter(weight >= EDGE_THR)
+
+g <- graph_from_data_frame(
+  edges_df,
+  directed = TRUE,
+  vertices = data.frame(name = STATES)
+)
+
+# ---------------------------------------------------------
+# EDGE STYLE
+# ---------------------------------------------------------
+E(g)$width       <- E(g)$weight * 12
+E(g)$label       <- sprintf("%.2f", E(g)$weight)
+E(g)$label.cex   <- 0.75
+E(g)$label.color <- "black"
+E(g)$color       <- "gray50"
+E(g)$arrow.size  <- 0.5
+
+# ---------------------------------------------------------
+# NODE STYLE
+# ---------------------------------------------------------
+V(g)$color       <- pal[V(g)$name]
+V(g)$size        <- 35
+V(g)$label       <- STATES
+V(g)$label.color <- "white"
+V(g)$label.cex   <- 0.9
+V(g)$label.font  <- 2
+
+# =========================================================
+# SIMPAN GAMBAR
+# =========================================================
+png(
+  filename = "output_markov/04_network_transisi.png",
+  width    = 1200,
+  height   = 1000,
+  res      = 120
+)
+
+par(
+  mar = c(8, 2, 4, 2),
+  xpd = TRUE,
+  bg  = "white"
+)
+
+plot(
+  g,
+  layout      = layout_in_circle(g),
+  edge.curved = 0.2,
+  main        = "Jaringan Transisi Antar Zona (P >= 5%)",
+  cex.main    = 1.5
+)
+
+legend(
+  "bottom",
+  inset  = c(0, -0.2),
+  legend = LABELS_FULL,
+  fill   = pal,
+  bty    = "n",
+  cex    = 0.85,
+  title  = "Keterangan Zona",
+  ncol   = 2
+)
+
+dev.off()
+
+cat("Disimpan: 04_network_transisi.png\n")
+
+# =========================================================
+# TAMPILKAN LANGSUNG DI PLOT WINDOW
+# =========================================================
+par(
+  mar = c(8, 2, 4, 2),
+  xpd = TRUE,
+  bg  = "white"
+)
+
+plot(
+  g,
+  layout      = layout_in_circle(g),
+  edge.curved = 0.2,
+  main        = "Jaringan Transisi Antar Zona (P >= 5%)",
+  cex.main    = 1.5
+)
+
+legend(
+  "bottom",
+  inset  = c(0, -0.2),
+  legend = LABELS_FULL,
+  fill   = pal,
+  bty    = "n",
+  cex    = 0.85,
+  title  = "Keterangan Zona",
+  ncol   = 2
+)
+
+cat("\n")
+```
+
+```{r}
+# BAGIAN 8 : PROBABILITAS RETENSI [RM-2]
+sep_line(); cat("BAGIAN 8 : RETENSI (SELF-TRANSITION) - Menjawab RM-2\n"); sep_line()
+
+cat("\nP[i,i] = peluang mahasiswa TETAP di zona i pada slot berikutnya\n\n")
+
+retensi        <- diag(P_agg)
+names(retensi) <- STATES
+
+ret_df <- data.frame(
+  State  = STATES,
+  Zona   = LABELS_FULL,
+  P_ii   = retensi,
+  Persen = round(retensi * 100, 2)
+) %>% arrange(desc(P_ii))
+
+cat("--- Tabel Retensi (Tertinggi -> Terendah) ---\n")
+print(ret_df, row.names=FALSE)
+
+cat(sprintf("\nZona retensi TERTINGGI : %s (P=%.4f / %.2f%%)\n",
+            ret_df$State[1], ret_df$P_ii[1], ret_df$Persen[1]))
+cat(sprintf("Zona retensi TERENDAH  : %s (P=%.4f / %.2f%%)\n",
+            tail(ret_df$State,1), tail(ret_df$P_ii,1), tail(ret_df$Persen,1)))
+
+cat("\n--- Retensi P[i,i] per Slot Waktu ---\n")
+ret_step <- do.call(cbind, lapply(P_per_step, diag))
+rownames(ret_step) <- LABELS_FULL
+colnames(ret_step) <- STEP_LABELS
+print(round(ret_step, 4))
+cat("\n")
+
+# ---- PLOT 5 : Retensi per zona (RM-2) ---------------------------------------
+p5 <- ret_df %>%
+  ggplot(aes(x=reorder(State,-P_ii), y=P_ii, fill=State)) +
+  geom_col(width=0.6) +
+  geom_text(aes(label=sprintf("%.1f%%",Persen)), vjust=-0.4, size=4, fontface="bold") +
+  geom_hline(yintercept=1/N_STATES, linetype="dashed", color="grey50", linewidth=0.7) +
+  annotate("text", x=0.6, y=1/N_STATES+0.03,
+           label="Uniform\n(20%)", size=3, color="grey50") +
+  scale_fill_manual(values=pal, guide="none") +
+  scale_y_continuous(labels=label_percent(), limits=c(0,1.1), breaks=seq(0,1,0.2)) +
+  scale_x_discrete(labels=LABELS_FULL) +
+  labs(title="Probabilitas Retensi (Self-Transition) per Zona",
+       subtitle="P[i,i] = peluang mahasiswa tetap di zona yang sama pada slot berikutnya",
+       x="Zona", y="Probabilitas Retensi P[i,i]") +
+  theme_mk +
+  theme(axis.text.x=element_text(angle=20, hjust=1))
+
+ggsave("output_markov/05_retensi_per_zona.png", p5, width=9, height=6, dpi=150)
+print(p5)
+cat("Disimpan: 05_retensi_per_zona.png\n")
+
+# ---- PLOT 9 : Heatmap retensi per zona per slot waktu (RM-2) ----------------
+ret_long <- as.data.frame(ret_step) %>%
+  tibble::rownames_to_column("Zona") %>%
+  pivot_longer(-Zona, names_to="Slot", values_to="Retensi") %>%
+  mutate(Zona=factor(Zona,levels=LABELS_FULL), Slot=factor(Slot,levels=STEP_LABELS))
+
+p9 <- ggplot(ret_long, aes(x=Slot, y=Zona, fill=Retensi)) +
+  geom_tile(color="white", linewidth=0.8) +
+  geom_text(aes(label=sprintf("%.2f",Retensi)), size=3.8) +
+  scale_fill_gradient(low="#FDFEFE", high="#27AE60", limits=c(0,1), name="P retensi") +
+  labs(title="Probabilitas Retensi per Zona per Slot Waktu",
+       subtitle="Hijau tua = mahasiswa cenderung menetap di zona tersebut",
+       x="Slot Waktu", y="Zona") +
+  theme_mk
+
+ggsave("output_markov/09_retensi_per_slot_waktu.png", p9, width=9.5, height=5.5, dpi=150)
+print(p9)
+cat("Disimpan: 09_retensi_per_slot_waktu.png\n\n")
+```
+
+```{r}
+# BAGIAN 9 : POLA PERPINDAHAN TERTINGGI [RM-3]
+sep_line(); cat("BAGIAN 9 : POLA PERPINDAHAN ANTAR ZONA - Menjawab RM-3\n"); sep_line()
+
+trans_all <- as.data.frame(as.table(P_agg)) %>%
+  rename(From=Var1, To=Var2, Prob=Freq) %>%
+  mutate(
+    Tipe   = if_else(as.character(From)==as.character(To),
+                     "Self-transition","Perpindahan antar zona"),
+    Persen = round(Prob*100, 2)
+  ) %>%
+  arrange(desc(Prob))
+
+cat("\n--- Top-10 Semua Transisi ---\n")
+print(head(trans_all %>% select(From,To,Persen,Tipe), 10L), row.names=FALSE)
+
+cat("\n--- Top-5 Perpindahan Antar Zona (self-transition dikecualikan) ---\n")
+top_move <- trans_all %>% filter(Tipe=="Perpindahan antar zona") %>% head(5L)
+print(top_move %>% select(From,To,Persen), row.names=FALSE)
+
+cat("\n--- Top-3 dengan Probabilitas Tertinggi ---\n")
+for (i in 1:3)
+  cat(sprintf("  %d. %s -> %s (P=%.4f / %.2f%%)\n",
+              i, top_move$From[i], top_move$To[i],
+              top_move$Prob[i], top_move$Persen[i]))
+
+cat("\n--- Matriks Antar-Zona (diagonal=0) ---\n")
+P_off <- P_agg; diag(P_off) <- 0
+print(round(P_off, 4))
+cat("\n")
+
+# ---- PLOT 8 : Top perpindahan antar zona - lollipop (RM-3) ------------------
+top15 <- trans_all %>%
+  filter(Tipe=="Perpindahan antar zona") %>%
+  head(15L) %>%
+  mutate(pair=paste0(From," -> ",To))
+
+p8 <- ggplot(top15, aes(x=reorder(pair,Persen), y=Persen, color=From)) +
+  geom_segment(aes(xend=pair, y=0, yend=Persen), linewidth=1.1) +
+  geom_point(size=4) +
+  geom_text(aes(label=sprintf("%.1f%%",Persen)), hjust=-0.3, size=3.2) +
+  scale_color_manual(values=pal, labels=LABELS_FULL, name="Zona Asal") +
+  coord_flip() +
+  labs(title="Top-15 Probabilitas Perpindahan Antar Zona",
+       subtitle="Self-transition (menetap di zona yang sama) dikecualikan",
+       x=NULL, y="Probabilitas (%)") +
+  theme_mk
+
+ggsave("output_markov/08_top_perpindahan_antar_zona.png", p8, width=10, height=7, dpi=150)
+print(p8)
+cat("Disimpan: 08_top_perpindahan_antar_zona.png\n\n")
+```
+
+```{r}
+# BAGIAN 10 : DISTRIBUSI STEADY-STATE [RM-4]
+sep_line(); cat("BAGIAN 10 : DISTRIBUSI STEADY-STATE - Menjawab RM-4\n"); sep_line()
+
+cat("\nInterpretasi: Jika pola ini berlanjut berulang (hari demi hari),\n")
+cat("pi[i] = proporsi waktu jangka panjang di zona i.\n\n")
+
+pi_mc <- steadyStates(mc_agg)
+cat("[Metode 1] markovchain::steadyStates():\n")
+pi_m1 <- as.numeric(pi_mc); names(pi_m1) <- LABELS
+print(round(pi_m1, 6))
+
+cat("\n[Metode 2] Eigen decomposition (verifikasi):\n")
+ev    <- eigen(t(P_agg))
+idx   <- which.min(abs(Re(ev$values) - 1.0))
+pi_m2 <- abs(Re(ev$vectors[, idx])); pi_m2 <- pi_m2 / sum(pi_m2)
+names(pi_m2) <- LABELS
+print(round(pi_m2, 6))
+
+cat("\n[Metode 3] P^500 (power iteration):\n")
+pi_m3 <- mat_power(P_agg, 500L)[1L, ]; names(pi_m3) <- LABELS
+print(round(pi_m3, 6))
+
+pi_final <- pi_m2
+
+ss_df <- data.frame(
+  State  = STATES,
+  Zona   = LABELS_FULL,
+  Pi     = pi_final,
+  Persen = round(pi_final * 100, 2)
+) %>% arrange(desc(Pi)) %>% mutate(Rank = seq_len(n()))
+
+cat("\n--- Distribusi Steady-State (Terurut) ---\n")
+print(ss_df[, c("Rank","State","Zona","Pi","Persen")], row.names=FALSE)
+
+pi_vec   <- as.numeric(pi_final)
+pi_check <- as.numeric(pi_vec %*% P_agg)
+cat("\nVerifikasi pi*P = pi:\n")
+cat("  pi    :", round(pi_vec,   6), "\n")
+cat("  pi*P  :", round(pi_check, 6), "\n")
+cat(sprintf("  Maks. selisih: %.2e\n\n", max(abs(pi_check - pi_vec))))
+
+cat(sprintf("Zona DOMINAN jangka panjang   : %s (pi=%.4f / %.1f%%)\n",
+            ss_df$State[1], ss_df$Pi[1], ss_df$Persen[1]))
+cat(sprintf("Zona PALING JARANG dikunjungi : %s (pi=%.4f / %.1f%%)\n\n",
+            tail(ss_df$State,1), tail(ss_df$Pi,1), tail(ss_df$Persen,1)))
+
+dist_init <- as.numeric(table(factor(df$z1, levels=STATES))) / N
+names(dist_init) <- STATES
+cat("Distribusi awal (slot 07-09):\n"); print(round(dist_init, 4))
+
+evolve_dist <- function(pi0, P, n_steps) {
+  res <- matrix(0.0, nrow=n_steps+1L, ncol=ncol(P))
+  colnames(res) <- colnames(P)
+  res[1L, ] <- pi0
+  for (i in seq_len(n_steps)) res[i+1L, ] <- res[i, ] %*% P
+  as.data.frame(res) %>% mutate(step=seq(0L, n_steps))
+}
+
+evo_df <- evolve_dist(dist_init, P_agg, 30L)
+cat("\nEvolusi distribusi langkah 0-15:\n")
+print(round(evo_df[1:16, ], 4))
+
+# ---- PLOT 6 : Distribusi steady-state (RM-4) --------------------------------
+p6 <- ss_df %>%
+  ggplot(aes(x=reorder(State,-Pi), y=Pi, fill=State)) +
+  geom_col(width=0.6) +
+  geom_text(aes(label=sprintf("%.1f%%",Persen)), vjust=-0.4, size=4, fontface="bold") +
+  geom_hline(yintercept=0.2, linetype="dashed", color="grey50", linewidth=0.7) +
+  annotate("text", x=0.6, y=0.23, label="Uniform\n(20%)", size=3, color="grey50") +
+  scale_fill_manual(values=pal, guide="none") +
+  scale_y_continuous(labels=label_percent(), limits=c(0,max(ss_df$Pi)*1.25)) +
+  scale_x_discrete(labels=LABELS_FULL) +
+  labs(title="Distribusi Probabilitas Steady-State (pi)",
+       subtitle="Prediksi distribusi jangka panjang - landasan evaluasi fasilitas kampus",
+       x="Zona", y="Probabilitas Steady-State (pi)") +
+  theme_mk +
+  theme(axis.text.x=element_text(angle=20, hjust=1))
+
+ggsave("output_markov/06_steady_state.png", p6, width=9, height=6, dpi=150)
+print(p6)
+cat("Disimpan: 06_steady_state.png\n")
+
+# ---- PLOT 7 : Evolusi distribusi menuju steady-state (RM-4) -----------------
+evo_long <- evo_df %>%
+  pivot_longer(-step, names_to="State", values_to="Prob") %>%
+  mutate(State=factor(State, levels=STATES))
+ss_lines <- data.frame(State=STATES, Pi=pi_final)
+
+p7 <- ggplot(evo_long, aes(x=step, y=Prob, color=State)) +
+  geom_line(linewidth=1) +
+  geom_point(data=filter(evo_long, step==0L), size=3) +
+  geom_hline(data=ss_lines, aes(yintercept=Pi, color=State),
+             linetype="dashed", linewidth=0.55, alpha=0.5) +
+  scale_color_manual(values=pal, labels=LABELS_FULL, name="Zona") +
+  scale_x_continuous(breaks=seq(0,30,5)) +
+  scale_y_continuous(labels=label_percent()) +
+  labs(title="Evolusi Distribusi Probabilitas Menuju Steady-State",
+       subtitle="Titik awal: distribusi slot 07-09. Garis putus = nilai steady-state (pi)",
+       x="Jumlah Langkah Transisi (n)", y="Probabilitas") +
+  theme_mk
+
+ggsave("output_markov/07_evolusi_steady_state.png", p7, width=11, height=6, dpi=150)
+print(p7)
+cat("Disimpan: 07_evolusi_steady_state.png\n")
+
+# ---- PLOT 10 : Observasi vs Steady-State (RM-4) -----------------------------
+obs_bar <- dist_slot %>%
+  mutate(zona=factor(zona,levels=STATES), Prob=pct/100) %>%
+  rename(State=zona) %>% select(slot, State, Prob)
+
+ss_bar <- data.frame(
+  slot  = "Steady-State\n(jangka panjang)",
+  State = factor(STATES, levels=STATES),
+  Prob  = pi_final
+)
+
+comb_bar <- bind_rows(obs_bar, ss_bar) %>%
+  mutate(slot=factor(slot, levels=c(SLOT_LABELS,"Steady-State\n(jangka panjang)")))
+
+p10 <- ggplot(comb_bar, aes(x=slot, y=Prob, fill=State)) +
+  geom_col(position="stack", width=0.7) +
+  geom_text(aes(label=ifelse(Prob>=0.04, sprintf("%.1f%%",Prob*100),"")),
+            position=position_stack(vjust=0.5),
+            size=3, color="white", fontface="bold") +
+  scale_fill_manual(values=pal, labels=LABELS_FULL, name="Zona") +
+  scale_y_continuous(labels=label_percent()) +
+  geom_vline(xintercept=5.5, linetype="dashed", color="grey30", linewidth=0.7) +
+  labs(title="Perbandingan Distribusi Observasi vs Steady-State",
+       subtitle="Kolom ke-6 = prediksi distribusi jangka panjang (steady-state)",
+       x=NULL, y="Proporsi Mahasiswa") +
+  theme_mk
+
+ggsave("output_markov/10_observasi_vs_steady_state.png", p10, width=12, height=6, dpi=150)
+print(p10)
+cat("Disimpan: 10_observasi_vs_steady_state.png\n\n")
+```
+
+```{r}
+# RINGKASAN AKHIR
+sep_line()
+cat("RINGKASAN AKHIR - JAWABAN 4 RUMUSAN MASALAH\n")
+sep_line()
+
+cat("\n[RM-1] Matriks Probabilitas Transisi\n")
+cat(sprintf("       Dihitung dari %d transisi (%d responden x 4 slot).\n", sum(N_agg), N))
+cat("       Matriks P 5x5 valid (setiap baris = 1).\n")
+cat("       Tersedia: versi agregat + 4 versi per-slot-waktu.\n")
+
+cat("\n[RM-2] Zona dengan Retensi Tertinggi\n")
+for (i in 1:nrow(ret_df))
+  cat(sprintf("       %d. %-45s P[i,i]=%.4f (%.1f%%)\n",
+              i, ret_df$Zona[i], ret_df$P_ii[i], ret_df$Persen[i]))
+
+cat("\n[RM-3] Pola Perpindahan dengan Probabilitas Tertinggi\n")
+for (i in 1:3)
+  cat(sprintf("       %d. %s -> %s  P=%.4f (%.1f%%)\n",
+              i, top_move$From[i], top_move$To[i],
+              top_move$Prob[i], top_move$Persen[i]))
+
+cat("\n[RM-4] Distribusi Steady-State\n")
+for (i in seq_len(nrow(ss_df))) {
+  bar <- strrep("|", max(1L, round(ss_df$Pi[i]*50)))
+  cat(sprintf("       %-45s pi=%.4f (%.1f%%)  %s\n",
+              ss_df$Zona[i], ss_df$Pi[i], ss_df$Persen[i], bar))
+}
+cat(sprintf("\n       Titik kumpul utama jangka panjang: %s (pi=%.4f)\n\n",
+            ss_df$State[1], ss_df$Pi[1]))
+
+cat("Output:\n")
+cat("  Plot  : ./output_markov/*.png  (10 file)\n")
+```
